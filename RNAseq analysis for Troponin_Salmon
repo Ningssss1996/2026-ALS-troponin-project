@@ -1,0 +1,326 @@
+---
+title: "RNAseq analysis for Troponin_Salmon"
+author: "Jianing"
+date: "2025-09-12"
+output: html_document
+For dataset:
+  Troponin: https://espace.library.uq.edu.au/view/UQ:b722f1f
+  Prerint Paper: https://www.medrxiv.org/content/10.1101/2023.03.13.23287229v1.full (2025)
+---
+
+#----1.1 Preparation of packages----    
+```{r, message= FALSE}
+#if(! require("stat_cor")) BiocManager::install("stat_cor",update=F,ask=F)
+#install.packages("lookup")
+#if(! require("DESeq2")) BiocManager::install("DESeq2",update=F,ask=F)
+library(sva)
+library(GEOquery)
+library(FactoMineR)
+library(factoextra)  
+library(tidyverse) 
+library(pheatmap)
+library(RColorBrewer)
+library(readxl)
+library(affy)
+library(stringr)
+library(DESeq2)
+library(readr) 
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(lookup)
+library(pheatmap)
+library(tidyverse)
+library(org.Hs.eg.db)
+library(data.table)  # for fast reading and merging
+library(R.utils)     
+library(umap)
+Sys.setenv("VROOM_CONNECTION_SIZE"=131072*2)
+options(stringsAsFactors = F)
+```
+
+#----1.2 Preparation of the dataset----
+```{r, message= FALSE}
+#1.2.1 dataset and patient info
+exprSet<- read.csv("C:/Jianing files/Troponin analysis/Salmon/salmon_muscle_counts_normalized.csv", header = TRUE, sep = ",", row.names = 1)
+exprSet <- round(exprSet, digits = 0)
+
+pData <- read.csv("C:/Jianing files/Troponin analysis/Salmon/muscle_phenotypes.csv", header = TRUE, sep = ",", row.names = 2)
+sample_anno <- pData[,2:5]
+all(rownames(sample_anno) == colnames(exprSet))  #check if all title match
+
+save(exprSet,pData,sample_anno,file='Troponin_beforeDE_Salmon.Rdata')
+rm(list=ls())
+```
+
+#----2.1 DeSeq2 analysis----
+```{r, message= FALSE}
+load(file = "Troponin_beforeDE_Salmon.Rdata")
+library(apeglm)
+
+# Step 1: Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = exprSet,
+                              colData = sample_anno,
+                              design = ~ sex + mnd)
+dds$mnd <- relevel(dds$mnd, ref = "Control")   #designate control group
+keep <- rowSums(counts(dds) >= 10) >=  17
+dds <- dds[keep,]
+
+# Step 2: Run DESeq
+dds <- DESeq(dds)
+res <- results(dds,contrast=c("mnd", "Case","Control"))  #result as ALS/CTL
+res <- lfcShrink(dds, coef="mnd_Case_vs_Control", type="apeglm")
+resOrdered <- res[order(res$padj),] 
+tempDEG <- as.data.frame(resOrdered)
+DEG_DEseq2 <- na.omit(tempDEG)
+
+#find the matched ENSEMBL
+DEG_DEseq2$ENSEMBL_ori <- rownames(DEG_DEseq2)  # temporarily store original IDs
+DEG_DEseq2$ENSEMBL <- gsub("\\.\\d+$", "", rownames(DEG_DEseq2))
+gene_map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = DEG_DEseq2$ENSEMBL,
+    columns = c("SYMBOL"),
+    keytype = "ENSEMBL"
+)
+
+# Add SYMBOL as rownames
+DEG_DEseq2 <- DEG_DEseq2 %>%
+  as.data.frame() %>%
+  left_join(gene_map, by = c("ENSEMBL" = "ENSEMBL"))   #Add gene symbol
+
+# Step 3: Transform for visualization or batch correction
+vsd <- vst(dds, blind=T)#DESeq2_normalization   use vst because the sample size is large
+dat <- as.data.frame(assay(vsd))  
+plotPCA(vsd, intgroup = "sex")
+plotPCA(vsd, intgroup = "replicate_batch")
+plotPCA(vsd, intgroup = "mnd")
+plotPCA(vsd, intgroup = "age")
+
+# Step 4: Apply ComBat if needed
+combat_transformed_data <- ComBat(dat = dat,  #This is only used for visualization
+                      batch = sample_anno$sex,      #Remove batch effect
+                      mod = model.matrix(~ mnd, data =colData(vsd) ))  # preserve group differences
+
+save(dds, res, vsd, dat, DEG_DEseq2,combat_transformed_data, file = "Troponin_DeSeq2_CasevsControl_Salmon.RData")
+write.csv(DEG_DEseq2,file = 'Troponin_DeSeq2_CasevsControl.csv')
+rm(list=ls())
+```
+   
+#----2.2 Data quality assessment by sample clustering and visualization----
+```{r, message= FALSE}
+load(file = "Troponin_beforeDE_Salmon.Rdata")
+load(file = "Troponin_DeSeq2_CasevsControl_Salmon.RData")
+
+##boxplot check
+boxplot(combat_transformed_data, outline = FALSE, notch = F, las = 2)
+max(combat_transformed_data)
+
+##Heatmap of the sample-to-sample distances
+sampleDists <- dist(t(combat_transformed_data))   
+sampleDistMatrix <- as.matrix(sampleDists)  
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255) 
+
+heatmap_distance=pheatmap::pheatmap(sampleDistMatrix,
+                   fontsize = 7,
+                   clustering_distance_rows = sampleDists,
+                   clustering_distance_cols = sampleDists,
+                   angle_col = 45,
+                   col = colors,
+                   annotation_col = sample_anno)
+
+```
+
+##Heatmap with correlation value
+```{r, message= FALSE}
+cor_matrix <- cor(combat_transformed_data, method = "pearson")
+heatmap_cor=pheatmap(cor_matrix,
+         fontsize = 7,
+         angle_col = 45,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         annotation_col = sample_anno,
+         display_numbers = TRUE,     # show correlation values
+         number_format = "%.2f")     # format to 2 decimal places
+
+```
+
+##PCA and visualization
+```{r, message= FALSE}
+selected_exprSet_t <- t(combat_transformed_data)# Transpose selected_exprSet to have samples as rows
+selected_exprSet_t <- selected_exprSet_t[, apply(selected_exprSet_t, 2, var) != 0]
+pca_result <- prcomp(selected_exprSet_t, scale. = TRUE)# Perform PCA
+pca_df <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_df) <- c("PC1", "PC2")
+
+# Add group information
+pca_df$Group1 <- sample_anno$sex  # Make sure group_info is a vector with names matching rownames(selected_exprSet_t)
+pca_df$Group2 <- sample_anno$mnd
+pca_df$Group3 <- sample_anno$age
+# Calculate mean points for each group
+group_means <- pca_df %>%
+  group_by(Group2) %>%
+  summarise(PC1 = mean(PC1), PC2 = mean(PC2))
+
+# Calculate explained variance
+explained_var <- round(100 * summary(pca_result)$importance[2, 1:2], 1)
+
+# Plot PCA
+PCA_Sex <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group1)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = rownames(pca_df)), vjust = -1, size = 3) +  
+  stat_ellipse(level = 0.90, linetype = "dashed", size = 1) +  
+  labs(title = "Principal Component Analysis_Troponin", 
+       x = paste0("PC1 (", explained_var[1], "%)"),
+       y = paste0("PC2 (", explained_var[2], "%)"),
+       color = "Groups") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+PCA_Sex
+
+PCA_group <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group2)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = rownames(pca_df)), vjust = -1, size = 3) +  
+  stat_ellipse(level = 0.90, linetype = "dashed", size = 1) +  
+  labs(title = "Principal Component Analysis_Troponin", 
+       x = paste0("PC1 (", explained_var[1], "%)"),
+       y = paste0("PC2 (", explained_var[2], "%)"),
+       color = "Groups") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+PCA_group
+
+PCA_age <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group3)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = rownames(pca_df)), vjust = -1, size = 3) +  
+  stat_ellipse(level = 0.90, linetype = "dashed", size = 1) +  
+  labs(title = "Principal Component Analysis_Troponin", 
+       x = paste0("PC1 (", explained_var[1], "%)"),
+       y = paste0("PC2 (", explained_var[2], "%)"),
+       color = "Groups") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+PCA_age
+ggsave(PCA_Sex, filename = "Troponin_PCA_Sex.tiff",width =6,height =6)
+ggsave(PCA_group, filename = "Troponin_PCA_group.tiff",width =6,height =6)
+ggsave(PCA_age, filename = "Troponin_PCA_age.tiff",width =6,height =6)
+
+```
+
+##UMAP
+```{r, message= FALSE}
+library(umap)
+library(ggplot2)
+  
+# Transpose and convert expression set to data frame
+umap_input <- as.data.frame(t(combat_transformed_data))
+
+# Run UMAP
+umap_result <- umap(umap_input, method = "naive", n_neighbors = 6)
+
+# Prepare data for plotting
+df <- data.frame(X = umap_result$layout[,1],
+                 Y = umap_result$layout[,2],
+                 label = rownames(umap_result$layout),
+                 group = sample_anno$mnd)
+
+
+# Plot UMAP# Plot UMAPGroup
+ggplot(df, aes(x = X, y = Y, colour = group)) +
+  geom_point(size = 4) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = "black", size = 0.5),
+    legend.title = element_blank()
+  ) +
+  xlab(NULL) + ylab(NULL)
+```
+
+##Heatmap: according to top 500 genes with high expression
+```{r, message= FALSE}
+dat_500 <- combat_transformed_data[names(sort(apply(combat_transformed_data,1,mad),decreasing = T)[1:500]),]
+M <- as.data.frame(cor(dat_500))
+
+Heatmap_500 <-pheatmap::pheatmap(M,
+                        show_rownames = T,
+                        angle_col=45,
+                        fontsize=7,
+                        annotation_col = sample_anno ) 
+Heatmap_500
+rm(list=ls())
+```
+
+# 3. Get DEG of a certain list
+```{r, message= FALSE}
+load(file = "Troponin_beforeDE_Salmon.Rdata")
+load(file = "Troponin_DeSeq2_CasevsControl_Salmon.RData")
+GeneOI <- c("TNNI1","TNNI2","TNNI3","TNNT1","TNNT2","TNNT3")
+DEGSubset <- DEG_DEseq2[DEG_DEseq2$SYMBOL %in% GeneOI, ]# Subset expression data
+ENSEMBL_OI <- DEGSubset$ENSEMBL_ori
+exprSubset <- combat_transformed_data[rownames(combat_transformed_data) %in% ENSEMBL_OI, ]
+exprSubset <- as.data.frame(exprSubset)
+rownames(exprSubset) <- ifelse(
+  is.na(match(rownames(exprSubset), DEGSubset$ENSEMBL_ori)),
+  rownames(exprSubset),
+  DEGSubset$SYMBOL[match(rownames(exprSubset), DEGSubset$ENSEMBL_ori)]
+)
+
+
+# --- 1. Melt expression data to long format ---
+df_long <- reshape2::melt(as.matrix(exprSubset), 
+                          varnames = c("Gene", "Sample"), 
+                          value.name = "Expression")
+
+# Add group info
+df_long$Group <- pData[df_long$Sample, "mnd"]
+
+# --- 2. Prepare annotation table ---
+# Create fold change / p-value label
+DEGSubset$label <- paste0("log2(Case/Control)=", round(DEGSubset$log2FoldChange, 2), 
+                      "\npadj=", signif(DEGSubset$padj, 3))
+
+# Compute annotation positions above each gene facet
+annotation <- df_long %>%
+  group_by(Gene) %>%
+  summarise(y_pos = max(Expression) * 1.05) %>%  # position above dots
+  left_join(DEGSubset, by = c("Gene" = "SYMBOL"))
+
+# --- 3. Dotplot with error bars and annotations ---
+dotplot <- ggplot(df_long, aes(x = Group, y = Expression, color = Group)) +
+  # Jittered dots
+  geom_point(position = position_jitter(width = 0.2), size = 2, alpha = 0.7) +
+  # Error bars for mean ± SD
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1),  # SD; use mult=1.96 for 95% CI
+               geom = "errorbar", width = 0.2, aes(color = Group)) +
+  # Optional: add a mean point
+  stat_summary(fun = mean, geom = "crossbar",  width = 0.4, aes(color = Group)) +
+  # Annotation for fold change / p-value
+  geom_text(data = annotation, aes(x = 1.5, y = y_pos, label = label), 
+            inherit.aes = FALSE, hjust = 0.5, size = 2.5) +
+  facet_wrap(~ Gene, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),plot.title = element_text(hjust = 0.5) ) +
+  labs(title = "Troponin isotype gene expression (Salmon counts)",
+       y = "Batch-corrected VST expression",
+       x = "Group")
+
+ggsave(dotplot, filename = "Troponin_Salmon_isotypes.tiff",width =6,height =8)
+write.csv(DEGSubset,"Troponin_Salmon_isotypes.csv",quote = F)#  
+  
+```
